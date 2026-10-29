@@ -23,6 +23,10 @@ var languages = map[string]*language{
 			{"parser.go", builtin(`go_parser`)},
 			{"parser_tables.go", builtin(`go_parser_tables`)},
 		},
+		GeneralizedParser: []file{
+			{"parser.go", builtin(`go_generalized_parser`)},
+			{"parser_tables.go", builtin(`go_generalized_parser_tables`)},
+		},
 		Stream: []file{
 			{"stream.go", builtin(`go_stream`)},
 		},
@@ -91,14 +95,15 @@ type file struct {
 }
 
 type language struct {
-	Lexer    []file
-	Parser   []file
-	Stream   []file
-	Types    []file
-	Selector []file
-	AST      []file
-	TypedAST []file
-	Bison    []file
+	Lexer             []file
+	Parser            []file
+	GeneralizedParser []file
+	Stream            []file
+	Types             []file
+	Selector          []file
+	AST               []file
+	TypedAST          []file
+	Bison             []file
 
 	SharedDefs string
 	CachedDefs string
@@ -116,7 +121,11 @@ func (l *language) templates(g *grammar.Grammar) []file {
 		}
 	}
 	if g.Parser.Tables != nil {
-		ret = append(ret, l.Parser...)
+		if g.Options.Generalized {
+			ret = append(ret, l.GeneralizedParser...)
+		} else {
+			ret = append(ret, l.Parser...)
+		}
 		if g.Options.TokenStream {
 			ret = append(ret, l.Stream...)
 		}

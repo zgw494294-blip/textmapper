@@ -1,0 +1,49 @@
+{{- template "header" . -}}
+package {{short_pkg .Options.Package}}
+
+{{$stateType := bits_per_element .Parser.Tables.FromTo -}}
+// genCell lists every parser action allowed in one parser state on one
+// lookahead terminal. terminal == -1 means the actions apply to any
+// lookahead terminal (the single reduction of an LR(0) reduce state).
+//
+// An action of -1 shifts the lookahead terminal; any action >= 0 reduces the
+// rule with this index. Unresolved shift/reduce and reduce/reduce conflicts
+// are represented by several actions, which the generalized parser explores
+// in parallel.
+type genCell struct {
+	terminal int32
+	actions  []int32
+}
+
+// tmGenActions is indexed by parser state.
+var tmGenActions = [][]genCell{
+{{- range $state, $cells := .Parser.Tables.GenActions}}
+{{- if $cells}}
+	[]genCell{ // state {{$state}}
+{{- range $cells}}
+		{terminal: {{.Terminal}}, actions: []int32{
+			{{- range $i, $a := .Actions}}{{if ne $i 0}}, {{end}}{{$a}}{{end -}}
+		}},
+{{- end}}
+	},
+{{- else}}
+	nil, // state {{$state}}
+{{- end}}
+{{- end}}
+}
+
+var tmGoto = [...]int32{
+{{- int_array .Parser.Tables.Goto "\t" 79 -}}
+}
+
+var tmFromTo = [...]int{{$stateType}}{
+{{- int_array .Parser.Tables.FromTo "\t" 79 -}}
+}
+
+var tmRuleLen = [...]int{{bits_per_element .Parser.Tables.RuleLen}}{
+{{- int_array .Parser.Tables.RuleLen "\t" 79 -}}
+}
+
+var tmRuleSymbol = [...]int32{
+{{- int_array .Parser.Tables.RuleSymbol "\t" 79 -}}
+}

@@ -280,6 +280,7 @@ type Options struct {
 
 	// Parser features.
 	GenParser              bool // true by default
+	Generalized            bool // Go-specific. Generate a generalized (GLR-style) parser accepting arbitrary finite CFGs.
 	Cancellable            bool // Go-specific.
 	RecursiveLookaheads    bool
 	DebugParser            bool

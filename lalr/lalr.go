@@ -117,6 +117,26 @@ type Tables struct {
 	UsedLADepth int      // maximum LALR(k) lookahead depth used (0 means pure LALR(1))
 	SR, RR      int      // number of shift/reduce and reduce/reduce conflicts
 	DebugInfo   []string // per state
+
+	// GenActions is populated only when the parser generator is invoked with
+	// Options.AllowConflicts. It lists every parser action allowed in each LALR state
+	// without collapsing unresolved conflicts into a single action. A generalized
+	// (GLR-style) parser explores all listed actions and decides at the end of the
+	// input whether the input has zero, one or many complete parses.
+	GenActions [][]GenCell
+}
+
+// GenCell lists parser actions allowed in one LALR state on one lookahead terminal.
+type GenCell struct {
+	// Terminal is the lookahead terminal the actions apply to. The special value -1
+	// means "any terminal" and is used for the single reduction of an LR(0)
+	// reduce-only state.
+	Terminal int32
+
+	// Actions contains encoded parser actions, in a fixed order:
+	//   -1           shift the lookahead terminal
+	//   any value >=0 reduce the rule with this index
+	Actions []int32
 }
 
 // DefaultEnc is a compact representation of the parser tables.

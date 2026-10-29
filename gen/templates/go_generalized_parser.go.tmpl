@@ -1,0 +1,474 @@
+{{ template "header" . -}}
+package {{short_pkg .Options.Package}}
+
+{{$stateType := bits_per_element .Parser.Tables.FromTo -}}
+// ErrAmbiguous is wrapped by the syntax error returned when the whole input
+// admits two or more structurally different complete parses. Callers can use
+// errors.Is(err, ErrAmbiguous) to distinguish a genuine ambiguity from a
+// plain syntax error.
+var ErrAmbiguous error = "errors".New("ambiguous input: more than one complete parse exists")
+
+// AmbiguousError is returned when the input can be parsed in two or more
+// structurally different ways (different productions or different parse
+// subtrees), even in the case all parses happen to evaluate to the same
+// semantic value.
+type AmbiguousError struct {
+{{ if .Options.TokenLine -}}
+	Line      int
+{{ end -}}
+	Offset    int
+	Endoffset int
+}
+
+func (e *AmbiguousError) Error() string {
+	return ErrAmbiguous.Error()
+}
+
+// Unwrap enables errors.Is(err, ErrAmbiguous).
+func (e *AmbiguousError) Unwrap() error {
+	return ErrAmbiguous
+}
+
+// SyntaxError is returned when no complete parse of the whole input exists.
+type SyntaxError struct {
+{{ if .Options.TokenLine -}}
+	Line      int
+{{ end -}}
+	Offset    int
+	Endoffset int
+}
+
+func (e SyntaxError) Error() string {
+{{ if .Options.TokenLine -}}
+	return "fmt".Sprintf("syntax error at line %v", e.Line)
+{{ else -}}
+	return "syntax error"
+{{ end -}}
+}
+
+// Parser is a generalized parser for {{.Name}}. Unlike the deterministic
+// table-driven parser, it keeps all alternatives allowed by the grammar and
+// only commits after checking whether the whole input has zero, one or many
+// complete parses. Semantic actions are deferred until the unique complete
+// parse is known.
+type Parser struct{}
+
+// Init resets the parser. Generalized parsers keep no per-parse state, so
+// calling Init between parses is optional.
+func (p *Parser) Init() {}
+
+const eoiToken = int32({{template "tokenPkg" .}}EOI)
+
+type symbol struct {
+	symbol    int32
+	offset    int
+	endoffset int
+}
+
+type stackEntry struct {
+	sym   symbol
+	value interface{}
+}
+
+{{ range $index, $inp := .Parser.Inputs -}}
+{{ if $inp.Synthetic }}{{continue}}{{end -}}
+{{ $nt := index $.Parser.Nonterms $inp.Nonterm -}}
+// Parse parses the next full token stream starting from the {{$nt.Name}} nonterminal.
+func (p *Parser) Parse{{if $.Parser.HasMultipleUserInputs}}{{$.NontermID $inp.Nonterm}}{{end}}(lexer *Lexer) {{if eq $nt.Type ""}}error{{else}}({{$nt.Type}}, error){{end}} {
+{{ if ne $nt.Type "" -}}
+	v, err := p.parse(int32({{$index}}), int32({{index $.Parser.Tables.FinalStates $index}}), lexer)
+	val, _ := v.({{$nt.Type}})
+	return val, err
+{{ else -}}
+	_, err := p.parse(int32({{$index}}), int32({{index $.Parser.Tables.FinalStates $index}}), lexer)
+	return err
+{{ end -}}
+}
+
+{{ end -}}
+// parse runs the generalized recognition and, for an input with exactly one
+// complete derivation, replays the semantic actions of that derivation once.
+func (p *Parser) parse(input, end int32, lexer *Lexer) (interface{}, error) {
+	e := newGenEngine(p, lexer)
+	e.tokenize()
+
+	root := e.frame(-1, input, -1)
+	active := []int32{root}
+	farthest := 0
+
+	for j := 0; j < len(e.tokens); j++ {
+		t := e.tokens[j].sym.symbol
+		if len(active) > 0 {
+			farthest = j
+		}
+
+		// Closure: apply all zero-token reductions allowed on the current
+		// lookahead terminal until no new stacks appear.
+		closure := make(map[int32]struct{})
+		shifters := make(map[int32]struct{})
+		queue := make([]int32, 0, len(active))
+		for _, f := range active {
+			closure[f] = struct{}{}
+			queue = append(queue, f)
+		}
+		for len(queue) > 0 {
+			f := queue[0]
+			queue = queue[1:]
+			reduces, canShift := e.actions(e.frames[f].state, t)
+			if canShift {
+				shifters[f] = struct{}{}
+			}
+			for _, rule := range reduces {
+				nf, ok := e.reduceFrame(f, rule, int32(j))
+				if !ok {
+					continue
+				}
+				if _, dup := closure[nf]; !dup {
+					closure[nf] = struct{}{}
+					queue = append(queue, nf)
+				}
+			}
+		}
+
+		// Consume the current token, one shifted stack per surviving alternative.
+		leaf := e.leaf(int32(j))
+		next := make([]int32, 0, len(shifters))
+		nextSet := make(map[int32]struct{})
+		for f := range shifters {
+			target := genGoto(e.frames[f].state, t)
+			if target < 0 {
+				continue
+			}
+			nf := e.frame(f, target, leaf)
+			if _, ok := nextSet[nf]; !ok {
+				nextSet[nf] = struct{}{}
+				next = append(next, nf)
+			}
+		}
+		active = next
+
+		if t == eoiToken {
+			// Collect the distinct start-nonterminal derivations that consumed
+			// the whole input.
+			var trees []int32
+			seen := make(map[int32]struct{})
+			for _, f := range active {
+				if e.frames[f].state != end {
+					continue
+				}
+				tree := e.frames[e.frames[f].parent].tree
+				if _, ok := seen[tree]; !ok {
+					seen[tree] = struct{}{}
+					trees = append(trees, tree)
+				}
+			}
+			switch {
+			case len(trees) == 1:
+				val, err := e.replay(trees[0])
+				if err != nil {
+					return nil, err
+				}
+				return val, nil
+			case len(trees) > 1:
+				last := e.tokens[len(e.tokens)-1]
+				return nil, &AmbiguousError{
+{{ if .Options.TokenLine -}}
+					Line:      last.line,
+{{ end -}}
+					Offset:    last.sym.offset,
+					Endoffset: last.sym.endoffset,
+				}
+			}
+			break
+		}
+
+		if len(active) == 0 {
+			break
+		}
+	}
+
+	bad := e.tokens[farthest]
+	return nil, SyntaxError{
+{{ if .Options.TokenLine -}}
+		Line:      bad.line,
+{{ end -}}
+		Offset:    bad.sym.offset,
+		Endoffset: bad.sym.endoffset,
+	}
+}
+
+// genGoto returns the parser state to go to with the given symbol, or -1 when
+// the transition does not exist.
+func genGoto(state, symbol int32) int32 {
+	min := tmGoto[symbol]
+	max := tmGoto[symbol+1]
+
+	if max-min < 32 {
+		for i := min; i < max; i += 2 {
+			if tmFromTo[i] == int{{$stateType}}(state) {
+				return int32(tmFromTo[i+1])
+			}
+		}
+	} else {
+		for min < max {
+			e := (min + max) >> 1 &^ int32(1)
+			i := tmFromTo[e]
+			if i == int{{$stateType}}(state) {
+				return int32(tmFromTo[e+1])
+			} else if i < int{{$stateType}}(state) {
+				min = e + 2
+			} else {
+				max = e
+			}
+		}
+	}
+	return -1
+}
+
+type genToken struct {
+	sym   symbol
+	value interface{}
+	line  int
+}
+
+// genNode is one node of a deferred parse tree. Terminal leaves have rule ==
+// -1 and token pointing at the buffered token; reductions carry the rule
+// index and the ordered list of child nodes.
+type genNode struct {
+	rule      int32
+	token     int32
+	sym       int32
+	offset    int
+	endoffset int
+	children  []int32
+}
+
+type genFrameKey struct {
+	parent int32
+	state  int32
+	tree   int32
+}
+
+// genEngine is a single generalized parse. Everything it owns is allocated
+// per Parse call, so failed, ambiguous or action-error parses never leak
+// state into later calls or other Parser instances.
+type genEngine struct {
+	p     *Parser
+	lexer *Lexer
+
+	tokens []genToken
+
+	nodes   []genNode
+	leafs   map[int32]int32
+	treeIDs map[string]int32
+
+	frames   []genFrame
+	frameIDs map[genFrameKey]int32
+}
+
+type genFrame struct {
+	parent int32
+	state  int32
+	tree   int32
+}
+
+func newGenEngine(p *Parser, lexer *Lexer) *genEngine {
+	return &genEngine{
+		p:        p,
+		lexer:    lexer,
+		leafs:    make(map[int32]int32),
+		treeIDs:  make(map[string]int32),
+		frameIDs: make(map[genFrameKey]int32),
+	}
+}
+
+// tokenize buffers the full token stream up to and including EOI. Lexer
+// actions run here exactly once and are never rolled back.
+func (e *genEngine) tokenize() {
+	for {
+		tok := e.lexer.Next()
+		switch tok {
+{{ if .ReportTokens true -}}
+		case {{range $ind, $tok := .ReportTokens true}}{{if ne $ind 0}}, {{end}}{{template "tokenPkg" $}}{{.ID}}{{end}}:
+			continue
+{{ end -}}
+{{ if not .ReportsInvalidToken -}}
+		case {{template "tokenPkg" .}}{{(index .Syms .Lexer.InvalidToken).ID}}:
+			continue
+{{ end -}}
+		}
+		s, end := e.lexer.Pos()
+		e.tokens = append(e.tokens, genToken{
+			sym:   symbol{symbol: int32(tok), offset: s, endoffset: end},
+			value: e.lexer.Value(),
+{{ if .Options.TokenLine -}}
+			line:  e.lexer.Line(),
+{{ end -}}
+		})
+		if tok == {{template "tokenPkg" .}}EOI {
+			return
+		}
+	}
+}
+
+func (e *genEngine) leaf(pos int32) int32 {
+	if id, ok := e.leafs[pos]; ok {
+		return id
+	}
+	t := e.tokens[pos]
+	id := int32(len(e.nodes))
+	e.nodes = append(e.nodes, genNode{
+		rule:      -1,
+		token:     pos,
+		sym:       t.sym.symbol,
+		offset:    t.sym.offset,
+		endoffset: t.sym.endoffset,
+	})
+	e.leafs[pos] = id
+	return id
+}
+
+// product interns a reduction node. Two nodes are identical iff they use the
+// same rule and identical child derivations; semantic values are intentionally
+// not part of the identity.
+func (e *genEngine) product(rule int32, children []int32, offset, endoffset int) int32 {
+	key := fmtRule(rule, children)
+	if id, ok := e.treeIDs[key]; ok {
+		return id
+	}
+	id := int32(len(e.nodes))
+	e.nodes = append(e.nodes, genNode{
+		rule:      rule,
+		sym:       tmRuleSymbol[rule],
+		offset:    offset,
+		endoffset: endoffset,
+		children:  append([]int32(nil), children...),
+	})
+	e.treeIDs[key] = id
+	return id
+}
+
+func fmtRule(rule int32, children []int32) string {
+	return "fmt".Sprintf("%d/%v", rule, children)
+}
+
+func (e *genEngine) frame(parent, state, tree int32) int32 {
+	key := genFrameKey{parent: parent, state: state, tree: tree}
+	if id, ok := e.frameIDs[key]; ok {
+		return id
+	}
+	id := int32(len(e.frames))
+	e.frames = append(e.frames, genFrame{parent: parent, state: state, tree: tree})
+	e.frameIDs[key] = id
+	return id
+}
+
+// actions returns the reductions allowed on the given lookahead terminal and
+// whether shifting the terminal is allowed. Precedence and nonassoc
+// declarations have already been applied when building tmGenActions.
+func (e *genEngine) actions(state, next int32) (reduces []int32, canShift bool) {
+	for _, c := range tmGenActions[state] {
+		if c.terminal != -1 && c.terminal != next {
+			continue
+		}
+		for _, a := range c.actions {
+			if a == -1 {
+				canShift = true
+			} else {
+				reduces = append(reduces, a)
+			}
+		}
+		return
+	}
+	// LR(0) shift states and terminals missing from a sparse state.
+	if genGoto(state, next) >= 0 {
+		canShift = true
+	}
+	return
+}
+
+// reduceFrame applies a zero-token rule reduction on top of frame f at token
+// position pos and returns the canonical resulting frame. ok is false when
+// the reduction has no valid continuation in the automaton, in which case
+// this speculative branch is dropped.
+func (e *genEngine) reduceFrame(f, rule, pos int32) (int32, bool) {
+	ln := int(tmRuleLen[rule])
+	children := make([]int32, ln)
+	top := f
+	for i := ln - 1; i >= 0; i-- {
+		children[i] = e.frames[top].tree
+		top = e.frames[top].parent
+	}
+
+	var offset, endoffset int
+	if ln == 0 {
+		offset = e.tokens[pos].sym.offset
+		endoffset = offset
+	} else {
+		offset = e.nodes[children[0]].offset
+		endoffset = e.nodes[children[ln-1]].endoffset
+	}
+	tree := e.product(rule, children, offset, endoffset)
+
+	state := genGoto(e.frames[top].state, tmRuleSymbol[rule])
+	if state < 0 {
+		return 0, false
+	}
+	return e.frame(top, state, tree), true
+}
+
+// replay executes the semantic actions of a unique complete derivation in the
+// original left-to-right reduction order. Each action runs once. An error
+// returned by an action stops the replay immediately and is propagated
+// without undoing earlier actions.
+func (e *genEngine) replay(root int32) (interface{}, error) {
+	var stack []stackEntry
+	if err := e.reduce(root, &stack); err != nil {
+		return nil, err
+	}
+	return stack[len(stack)-1].value, nil
+}
+
+func (e *genEngine) reduce(id int32, stack *[]stackEntry) error {
+	node := &e.nodes[id]
+	if node.rule == -1 {
+		t := e.tokens[node.token]
+		*stack = append(*stack, stackEntry{
+			sym:   symbol{node.sym, node.offset, node.endoffset},
+			value: t.value,
+		})
+		return nil
+	}
+
+	for _, child := range node.children {
+		if err := e.reduce(child, stack); err != nil {
+			return err
+		}
+	}
+
+	ln := len(node.children)
+	lhs := stackEntry{sym: symbol{node.sym, node.offset, node.endoffset}}
+	if err := e.p.applyRule(node.rule, &lhs, *stack, e.lexer); err != nil {
+		return err
+	}
+	*stack = (*stack)[:len(*stack)-ln]
+	*stack = append(*stack, lhs)
+	return nil
+}
+
+func (p *Parser) applyRule(rule int32, lhs *stackEntry, stack []stackEntry, lexer *Lexer) (err error) {
+{{ if .Parser.HasActions -}}
+	switch rule {
+{{ range $index, $rule := .Parser.Rules -}}
+{{ if ne $rule.Action 0 -}}
+{{ $act := index $.Parser.Actions $rule.Action -}}
+{{ if $act.Code -}}
+	case {{$index}}: // {{$.RuleString $rule}}
+{{go_parser_action $act.Code $act.Vars $act.Origin}}
+{{ end -}}
+{{ end -}}
+{{ end -}}
+	}
+{{ end -}}
+	return
+}

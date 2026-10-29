@@ -77,9 +77,12 @@ func (p *optionsParser) parseFrom(file ast.File) {
 			opts.FlexMode = p.parseExpr(opt.Value(), opts.FlexMode).(bool)
 		case "genParser":
 			opts.GenParser = p.parseExpr(opt.Value(), opts.GenParser).(bool)
+		case "generalized":
+			p.validLangs(opt.Key(), "go")
+			opts.Generalized = p.parseExpr(opt.Value(), opts.Generalized).(bool)
 		case "optInstantiationSuffix":
 			opts.OptInstantiationSuffix = p.parseExpr(opt.Value(), opts.OptInstantiationSuffix).(string)
-	    case "aliasIncludesOptSuffix":
+		case "aliasIncludesOptSuffix":
 			opts.AliasIncludesOptSuffix = p.parseExpr(opt.Value(), opts.AliasIncludesOptSuffix).(bool)
 		case "cancellable":
 			p.validLangs(opt.Key(), "go")

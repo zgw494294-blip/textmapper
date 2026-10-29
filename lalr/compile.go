@@ -24,13 +24,21 @@ type Options struct {
 	Debug          bool // embed debug information into the tables
 	DebugConflicts bool // report all conflicts even if they match expectations
 	Verbose        bool // verbose explanations of conflicts
+
+	// AllowConflicts keeps unresolved shift/reduce and reduce/reduce conflicts in the
+	// generated tables (see Tables.GenActions) instead of reporting them as compilation
+	// errors. Conflict resolutions explicitly declared in the grammar (operator
+	// precedence, left/right/nonassoc) are still applied. This is used by the
+	// generalized (GLR-style) Go parser.
+	AllowConflicts bool
 }
 
 // Compile generates LALR tables for a given grammar.
 func Compile(grammar *Grammar, opts Options) (*Tables, error) {
 	c := &compiler{
-		grammar:   grammar,
-		lookahead: max(opts.Lookahead, 1),
+		grammar:        grammar,
+		lookahead:      max(opts.Lookahead, 1),
+		allowConflicts: opts.AllowConflicts,
 		out: &Tables{
 			DefaultEnc: &DefaultEnc{},
 		},
@@ -53,6 +61,9 @@ func Compile(grammar *Grammar, opts Options) (*Tables, error) {
 		c.resolveWithLookahead()
 	}
 	c.reportConflicts(opts.Verbose, opts.DebugConflicts)
+	if opts.AllowConflicts {
+		c.populateGenActions()
+	}
 
 	if opts.Debug {
 		c.exportDebugInfo()
@@ -69,11 +80,12 @@ func Compile(grammar *Grammar, opts Options) (*Tables, error) {
 }
 
 type compiler struct {
-	grammar   *Grammar
-	lookahead int
-	out       *Tables
-	s         status.Status
-	conflicts []*Conflict // to be reported if the number of conflicts does not match the expectations
+	grammar        *Grammar
+	lookahead      int
+	allowConflicts bool
+	out            *Tables
+	s              status.Status
+	conflicts      []*Conflict // to be reported if the number of conflicts does not match the expectations
 
 	index   []int // the rule start in "right"
 	right   []int // all rules flattened into one slice, each position in this slice is an LR(0) item
@@ -956,6 +968,11 @@ func (c *compiler) reduceRuleInfo(state *state, rule int, next, seen container.B
 func (c *compiler) reportConflicts(verbose bool, includeResolved bool) {
 	c.out.SR = c.sr
 	c.out.RR = c.rr
+	if c.allowConflicts {
+		// Unresolved conflicts are exposed to the generalized parser via Tables.GenActions
+		// instead of failing the compilation.
+		return
+	}
 	verbose = verbose || includeResolved // includeResolved implies verbose because we don't have a flag for verbose.
 	if !includeResolved && c.sr == c.grammar.ExpectSR && c.rr == c.grammar.ExpectRR {
 		return

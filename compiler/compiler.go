@@ -50,6 +50,9 @@ func Compile(ctx context.Context, path, content string, params Params) (*grammar
 	c.compileParser(file)
 
 	c.out.CustomTemplates = strings.TrimPrefix(file.Child(selector.Templates).Text(), "%%")
+	if c.out.Options.Generalized && strings.TrimSpace(c.out.CustomTemplates) != "" {
+		s.Errorf(file.Child(selector.Templates), "custom templates (%% blocks) are not supported in generalized parsers")
+	}
 	return c.out, s.Err()
 }
 
@@ -246,6 +249,12 @@ func (c *compiler) compileParser(file ast.File) {
 		// Lexer-only grammar.
 		return
 	}
+	if c.out.Options.Generalized {
+		if err := checkGeneralizedOptions(c.out.Options, file.Header()); err != nil {
+			c.AddError(err)
+			return
+		}
+	}
 	target, _ := file.Header().Target()
 	loader := newSyntaxLoader(c.resolver, target.Text(), c.out.Options, c.Status)
 	loader.load(p, file.Header())
@@ -364,6 +373,10 @@ func (c *compiler) compileParser(file ast.File) {
 			c.Errorf(la, "LALR(k) is supported when targeting Go only")
 			lookahead = 1
 		}
+		if lookahead > 1 && c.out.Options.Generalized {
+			c.Errorf(la, "LALR(k) with k > 1 is not supported in generalized parsers")
+			lookahead = 1
+		}
 	}
 
 	opts := genOptions{
@@ -380,8 +393,71 @@ func (c *compiler) compileParser(file ast.File) {
 			Verbose:        c.params.Verbose,
 		},
 	}
+	if c.out.Options.Generalized {
+		// The generalized parser consumes the non-compressed action table and explores
+		// unresolved conflicts itself.
+		opts.lalrOpts.Optimize = false
+		opts.lalrOpts.DefaultReduce = false
+		opts.lalrOpts.AllowConflicts = true
+	}
 	if err := generateTables(source, c.out, opts, file); err != nil {
 		c.AddError(err)
+		return
+	}
+	if c.out.Options.Generalized {
+		c.validateGeneralizedTables(file)
+	}
+}
+
+// checkGeneralizedOptions rejects grammar options that are incompatible with
+// the generalized parsing mode.
+func checkGeneralizedOptions(opts *grammar.Options, origin status.SourceNode) error {
+	var unsupported []string
+	switch {
+	case opts.EventBased:
+		unsupported = append(unsupported, "eventBased")
+	case opts.TokenStream:
+		unsupported = append(unsupported, "tokenStream")
+	case opts.EventFields:
+		unsupported = append(unsupported, "eventFields")
+	case opts.EventAST:
+		unsupported = append(unsupported, "eventAST")
+	case opts.GenSelector:
+		unsupported = append(unsupported, "genSelector")
+	case opts.FixWhitespace:
+		unsupported = append(unsupported, "fixWhitespace")
+	case opts.Cancellable:
+		unsupported = append(unsupported, "cancellable")
+	case opts.CancellableFetch:
+		unsupported = append(unsupported, "cancellableFetch")
+	}
+	if len(unsupported) > 0 {
+		return status.Errorf(origin, "generalized parsers do not support %s", strings.Join(unsupported, ", "))
+	}
+	return nil
+}
+
+// validateGeneralizedTables rejects grammars whose compiled form uses parser
+// features the generalized engine does not implement.
+func (c *compiler) validateGeneralizedTables(file ast.File) {
+	p := c.out.Parser
+	for _, nt := range p.Nonterms {
+		if nt.Value != nil && nt.Value.Kind == syntax.Lookahead {
+			c.Errorf(file.Header(), "runtime lookahead predicates (?=) are not supported in generalized parsers")
+			return
+		}
+	}
+	switch {
+	case p.Tables == nil:
+		c.Errorf(file.Header(), "generalized parsers require a parser (genParser = true)")
+	case len(p.Tables.Markers) > 0:
+		c.Errorf(file.Header(), "state markers (lr0, greedy, recovery scopes) are not supported in generalized parsers")
+	case len(p.Tables.Lookaheads) > 0:
+		c.Errorf(file.Header(), "runtime lookahead predicates (?=) are not supported in generalized parsers")
+	case p.Tables.UsedLADepth > 0:
+		c.Errorf(file.Header(), "LALR(k) with k > 1 is not supported in generalized parsers")
+	case p.IsRecovering:
+		c.Errorf(file.Header(), "error recovery (the 'error' token and afterErr sets) is not supported in generalized parsers")
 	}
 }
 
@@ -683,6 +759,11 @@ func generateTables(source *syntax.Model, out *grammar.Grammar, opts genOptions,
 		}
 		r.Action = actionID
 		g.Rules[i].Action = actionID
+	}
+
+	if out.Options.Generalized && lalr.HasNullableCycle(g) {
+		s.Errorf(origin, "the grammar contains a zero-length recursive nonterminal cycle, which is not supported in generalized parsers")
+		return s.Err()
 	}
 
 	tables, err := lalr.Compile(g, opts.lalrOpts)
